@@ -14,15 +14,17 @@ using json = nlohmann::json;
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
+
 double deg2rad(double x) { return x * pi() / 180; }
+
 double rad2deg(double x) { return x * 180 / pi(); }
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
 // else the empty string "" will be returned.
-string hasData(string s) {
+string hasData(const string &s) {
   auto found_null = s.find("null");
-  auto b1 = s.find_first_of("[");
+  auto b1 = s.find_first_of('[');
   auto b2 = s.rfind("}]");
   if (found_null != string::npos) {
     return "";
@@ -44,8 +46,7 @@ double polyeval(Eigen::VectorXd coeffs, double x) {
 // Fit a polynomial.
 // Adapted from
 // https://github.com/JuliaMath/Polynomials.jl/blob/master/src/Polynomials.jl#L676-L716
-Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
-                        int order) {
+Eigen::VectorXd polyfit(Eigen::VectorXd xvals, const Eigen::VectorXd &yvals, int order) {
   assert(xvals.size() == yvals.size());
   assert(order >= 1 && order <= xvals.size() - 1);
   Eigen::MatrixXd A(xvals.size(), order + 1);
@@ -65,6 +66,20 @@ Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
   return result;
 }
 
+std::pair<vector<double>, vector<double>>
+transformToVehicleCoordinates(double orig_x, double orig_y, double psi, const vector<double> &x,
+                              const vector<double> &y) {
+  vector<double> trans_x(x.size());
+  vector<double> trans_y(x.size());
+
+  for (size_t i = 0; i < x.size(); i++) {
+    trans_x[i] = cos(psi) * (x[i] - orig_x) + sin(psi) * (y[i] - orig_y);
+    trans_y[i] = -sin(psi) * (x[i] - orig_x) + cos(psi) * (y[i] - orig_y);
+  }
+
+  return std::make_pair(trans_x, trans_y);
+}
+
 int main() {
   uWS::Hub h;
 
@@ -80,7 +95,7 @@ int main() {
     cout << sdata << endl;
     if (sdata.size() > 2 && sdata[0] == '4' && sdata[1] == '2') {
       string s = hasData(sdata);
-      if (s != "") {
+      if (!s.empty()) {
         auto j = json::parse(s);
         string event = j[0].get<string>();
         if (event == "telemetry") {
@@ -92,14 +107,20 @@ int main() {
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
 
-          /*
-          * TODO: Calculate steering angle and throttle using MPC.
-          *
-          * Both are in between [-1, 1].
-          *
-          */
-          double steer_value;
-          double throttle_value;
+          auto len = ptsx.size();
+          auto xy_pair = transformToVehicleCoordinates(px, py, psi, ptsx, ptsy);
+
+          Eigen::VectorXd ref_x = Eigen::Map<Eigen::VectorXd, Eigen::Unaligned>(xy_pair.first.data(), len);
+          Eigen::VectorXd ref_y = Eigen::Map<Eigen::VectorXd, Eigen::Unaligned>(xy_pair.second.data(), len);
+          Eigen::VectorXd coeffs = polyfit(ref_x, ref_y, 3);
+          Eigen::VectorXd state(6);
+          state << 0, 0, v, 0, polyeval(coeffs, 0), - atan(coeffs[1]);
+
+          // solve
+          auto res = mpc.Solve(state, coeffs);
+
+          double throttle_value = res.a;
+          double steer_value = -res.delta / deg2rad(25);
 
           json msgJson;
           // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
@@ -108,18 +129,19 @@ int main() {
           msgJson["throttle"] = throttle_value;
 
           //Display the MPC predicted trajectory 
-          vector<double> mpc_x_vals;
-          vector<double> mpc_y_vals;
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Green line
-
-          msgJson["mpc_x"] = mpc_x_vals;
-          msgJson["mpc_y"] = mpc_y_vals;
+          msgJson["mpc_x"] = res.x;
+          msgJson["mpc_y"] = res.y;
 
           //Display the waypoints/reference line
-          vector<double> next_x_vals;
+          vector<double> next_x_vals = xy_pair.first;
           vector<double> next_y_vals;
+          next_y_vals.reserve(next_x_vals.size());
+          for (auto x : next_x_vals) {
+            next_y_vals.push_back(polyeval(coeffs, x));
+          }
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Yellow line
@@ -132,7 +154,7 @@ int main() {
           std::cout << msg << std::endl;
           // Latency
           // The purpose is to mimic real driving conditions where
-          // the car does actuate the commands instantly.
+          // the car doesn't actuate the commands instantly.
           //
           // Feel free to play around with this value but should be to drive
           // around the track with 100ms latency.
